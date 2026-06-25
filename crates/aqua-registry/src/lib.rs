@@ -8,6 +8,7 @@
 mod cache;
 mod codec;
 mod compiled;
+mod file_ext;
 mod template;
 pub mod types;
 
@@ -16,8 +17,8 @@ pub use cache::RegistryCache;
 pub use codec::{decode_package_rkyv, encode_package_rkyv};
 pub use compiled::{CompiledRegistry, ParsedRegistry};
 pub use types::{
-    AquaChecksum, AquaChecksumType, AquaCosign, AquaFile, AquaMinisignType, AquaPackage,
-    AquaPackageType, AquaVar, RegistryYaml,
+    AquaChecksum, AquaChecksumType, AquaCosign, AquaFile, AquaGithubArtifactAttestations,
+    AquaMinisign, AquaMinisignType, AquaPackage, AquaPackageType, AquaVar, RegistryYaml,
 };
 
 use thiserror::Error;

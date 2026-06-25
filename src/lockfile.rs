@@ -1,5 +1,6 @@
 use crate::backend::backend_type::BackendType;
 use crate::backend::conda::CondaBackend;
+use crate::backend::pkgx::PkgxBackend;
 use crate::backend::platform_target::PlatformTarget;
 use crate::config::{Config, Settings};
 use crate::env;
@@ -50,6 +51,9 @@ pub struct Lockfile {
     /// Basename includes version+build (e.g., "ncurses-6.4-h7ea286d_0")
     #[serde(skip)]
     conda_packages: BTreeMap<String, BTreeMap<String, CondaPackageInfo>>,
+    /// Shared pkgx packages: platform -> package@version -> PkgxPackageInfo
+    #[serde(skip)]
+    pkgx_packages: BTreeMap<String, BTreeMap<String, PkgxPackageInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +227,8 @@ pub enum GithubAttestationsStatus {
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub struct PlatformInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
     /// Size in bytes (read-only field, preserved from existing lockfiles but not written)
     #[serde(skip_serializing, default)]
@@ -234,6 +240,15 @@ pub struct PlatformInfo {
     /// References to conda packages in the shared conda-packages section (by basename)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conda_deps: Option<Vec<String>>,
+    /// References to pkgx packages in the shared pkgx-packages section (by package@version)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkgx_deps: Option<Vec<String>>,
+    /// Pkgx-provided binaries for the main package, captured for locked installs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkgx_provides: Option<Vec<String>>,
+    /// Pkgx runtime environment for the main package, captured for locked installs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkgx_runtime_env: Option<BTreeMap<String, String>>,
     /// Type of provenance verification that succeeded (SLSA carries its URL)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ProvenanceType>,
@@ -244,6 +259,7 @@ pub struct PlatformInfo {
 
 // Re-export CondaPackageInfo from conda backend for lockfile serialization
 pub use crate::backend::conda::CondaPackageInfo;
+pub use crate::backend::pkgx::PkgxPackageInfo;
 
 impl<'de> Deserialize<'de> for PlatformInfo {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -258,10 +274,14 @@ impl<'de> Deserialize<'de> for PlatformInfo {
 impl PlatformInfo {
     /// Returns true if this PlatformInfo has no meaningful data (for serde skip)
     pub fn is_empty(&self) -> bool {
-        self.checksum.is_none()
+        self.install.is_none()
+            && self.checksum.is_none()
             && self.url.is_none()
             && self.url_api.is_none()
             && self.conda_deps.is_none()
+            && self.pkgx_deps.is_none()
+            && self.pkgx_provides.is_none()
+            && self.pkgx_runtime_env.is_none()
             && self.provenance.is_none()
     }
 
@@ -279,11 +299,15 @@ impl PlatformInfo {
     ///   changes.
     pub fn merge_with(&self, other: &PlatformInfo) -> PlatformInfo {
         let url_changed = self.url.is_some() && other.url.is_some() && self.url != other.url;
+        let install_changed = self.install.is_some() && self.install != other.install;
+        let artifact_changed = url_changed
+            || install_changed
+            || (self.url.is_some() && other.install.as_deref() == Some("source"));
 
         // For checksums, prefer sha256 over blake3 since sha256 comes from
-        // official releases and is more portable/verifiable. If URLs disagree,
+        // official releases and is more portable/verifiable. If artifacts disagree,
         // ignore the other side's artifact-bound fields entirely.
-        let checksum = if url_changed {
+        let checksum = if artifact_changed {
             self.checksum.clone()
         } else {
             match (&self.checksum, &other.checksum) {
@@ -301,28 +325,52 @@ impl PlatformInfo {
             }
         };
 
-        let size = if url_changed {
+        let size = if artifact_changed {
             self.size
         } else {
             self.size.or(other.size)
         };
 
-        let url_api = if url_changed {
+        let url_api = if artifact_changed {
             self.url_api.clone()
         } else {
             self.url_api.clone().or_else(|| other.url_api.clone())
         };
 
-        let provenance = match (self.provenance.clone(), other.provenance.clone()) {
-            (Some(a), Some(b)) => Some(a.merge(b)),
-            (a, b) => a.or(b),
+        let provenance = if artifact_changed {
+            self.provenance.clone()
+        } else {
+            match (self.provenance.clone(), other.provenance.clone()) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => a.or(b),
+            }
         };
         PlatformInfo {
+            install: self.install.clone().or_else(|| {
+                if self.url.is_some() {
+                    None
+                } else {
+                    other.install.clone()
+                }
+            }),
             checksum,
             size,
-            url: self.url.clone().or_else(|| other.url.clone()),
+            url: if artifact_changed {
+                self.url.clone()
+            } else {
+                self.url.clone().or_else(|| other.url.clone())
+            },
             url_api,
             conda_deps: self.conda_deps.clone().or_else(|| other.conda_deps.clone()),
+            pkgx_deps: self.pkgx_deps.clone().or_else(|| other.pkgx_deps.clone()),
+            pkgx_provides: self
+                .pkgx_provides
+                .clone()
+                .or_else(|| other.pkgx_provides.clone()),
+            pkgx_runtime_env: self
+                .pkgx_runtime_env
+                .clone()
+                .or_else(|| other.pkgx_runtime_env.clone()),
             provenance,
             github_attestations: None,
         }
@@ -338,6 +386,13 @@ impl TryFrom<toml::Value> for PlatformInfo {
                 ..Default::default()
             }),
             toml::Value::Table(mut t) => {
+                let install = match t.remove("install") {
+                    Some(toml::Value::String(s)) if s == "source" => Some(s),
+                    Some(toml::Value::String(s)) => {
+                        bail!("unrecognized install {s:?} in lockfile")
+                    }
+                    _ => None,
+                };
                 let checksum = match t.remove("checksum") {
                     Some(toml::Value::String(s)) => Some(s),
                     _ => None,
@@ -369,6 +424,28 @@ impl TryFrom<toml::Value> for PlatformInfo {
                     }
                     Some(toml::Value::String(s)) => {
                         bail!("unrecognized github_attestations status {s:?} in lockfile")
+                    }
+                    _ => None,
+                };
+                let pkgx_deps = match t.remove("pkgx_deps") {
+                    Some(toml::Value::Array(arr)) => Some(
+                        arr.into_iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                let pkgx_provides = match t.remove("pkgx_provides") {
+                    Some(toml::Value::Array(arr)) => Some(
+                        arr.into_iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                let pkgx_runtime_env = match t.remove("pkgx_runtime_env") {
+                    Some(toml::Value::Table(table)) => {
+                        Some(string_table_from_toml_value(toml::Value::Table(table))?)
                     }
                     _ => None,
                 };
@@ -415,11 +492,15 @@ impl TryFrom<toml::Value> for PlatformInfo {
                     github_attestations
                 };
                 Ok(PlatformInfo {
+                    install,
                     checksum,
                     size,
                     url,
                     url_api,
                     conda_deps,
+                    pkgx_deps,
+                    pkgx_provides,
+                    pkgx_runtime_env,
                     provenance,
                     github_attestations,
                 })
@@ -432,6 +513,9 @@ impl TryFrom<toml::Value> for PlatformInfo {
 impl From<PlatformInfo> for toml::Value {
     fn from(platform_info: PlatformInfo) -> Self {
         let mut table = toml::Table::new();
+        if let Some(install) = platform_info.install {
+            table.insert("install".to_string(), install.into());
+        }
         if let Some(checksum) = platform_info.checksum {
             table.insert("checksum".to_string(), checksum.into());
         }
@@ -448,6 +532,28 @@ impl From<PlatformInfo> for toml::Value {
                 .collect::<Vec<_>>()
                 .into();
             table.insert("conda_deps".to_string(), deps);
+        }
+        if let Some(pkgx_deps) = platform_info.pkgx_deps {
+            let deps: toml::Value = pkgx_deps
+                .into_iter()
+                .map(toml::Value::String)
+                .collect::<Vec<_>>()
+                .into();
+            table.insert("pkgx_deps".to_string(), deps);
+        }
+        if let Some(pkgx_provides) = platform_info.pkgx_provides {
+            let provides: toml::Value = pkgx_provides
+                .into_iter()
+                .map(toml::Value::String)
+                .collect::<Vec<_>>()
+                .into();
+            table.insert("pkgx_provides".to_string(), provides);
+        }
+        if let Some(pkgx_runtime_env) = platform_info.pkgx_runtime_env {
+            table.insert(
+                "pkgx_runtime_env".to_string(),
+                toml::Value::Table(toml_table_from_string_map(pkgx_runtime_env)),
+            );
         }
         if let Some(ref provenance) = platform_info.provenance {
             match provenance {
@@ -489,6 +595,65 @@ impl TryFrom<toml::Value> for CondaPackageInfo {
             _ => bail!("unsupported conda package info format"),
         }
     }
+}
+
+impl TryFrom<toml::Value> for PkgxPackageInfo {
+    type Error = Report;
+    fn try_from(value: toml::Value) -> Result<Self> {
+        match value {
+            toml::Value::Table(mut t) => {
+                let url = t
+                    .remove("url")
+                    .and_then(|v| match v {
+                        toml::Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .ok_or_else(|| eyre::eyre!("missing url in pkgx package info"))?;
+                let checksum = match t.remove("checksum") {
+                    Some(toml::Value::String(s)) => Some(s),
+                    _ => None,
+                };
+                let pkgx_provides = match t.remove("pkgx_provides") {
+                    Some(toml::Value::Array(arr)) => Some(
+                        arr.into_iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                let pkgx_runtime_env = match t.remove("pkgx_runtime_env") {
+                    Some(toml::Value::Table(table)) => {
+                        Some(string_table_from_toml_value(toml::Value::Table(table))?)
+                    }
+                    _ => None,
+                };
+                Ok(PkgxPackageInfo {
+                    url,
+                    checksum,
+                    pkgx_provides,
+                    pkgx_runtime_env,
+                })
+            }
+            _ => bail!("unsupported pkgx package info format"),
+        }
+    }
+}
+
+fn string_table_from_toml_value(value: toml::Value) -> Result<BTreeMap<String, String>> {
+    match value {
+        toml::Value::Table(table) => Ok(table
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                toml::Value::String(value) => Some((key, value)),
+                _ => None,
+            })
+            .collect()),
+        _ => Ok(BTreeMap::new()),
+    }
+}
+
+fn toml_table_from_string_map(values: BTreeMap<String, String>) -> toml::Table {
+    values.into_iter().map(|(k, v)| (k, v.into())).collect()
 }
 
 impl Lockfile {
@@ -537,6 +702,22 @@ impl Lockfile {
             }
         }
 
+        // Parse pkgx-packages section: platform -> package@version -> PkgxPackageInfo
+        if let Some(pkgx_packages) = table.remove("pkgx-packages") {
+            let platforms: toml::Table = pkgx_packages.try_into()?;
+            for (platform, packages) in platforms {
+                let packages_table: toml::Table = packages.try_into()?;
+                for (id, info) in packages_table {
+                    let info: PkgxPackageInfo = info.try_into()?;
+                    lockfile
+                        .pkgx_packages
+                        .entry(platform.clone())
+                        .or_default()
+                        .insert(id, info);
+                }
+            }
+        }
+
         Ok(lockfile)
     }
 
@@ -559,6 +740,40 @@ impl Lockfile {
                 conda_packages.insert(platform.clone(), platform_table.into());
             }
             lockfile.insert("conda-packages".to_string(), conda_packages.into());
+        }
+
+        if !self.pkgx_packages.is_empty() {
+            let mut pkgx_packages = toml::Table::new();
+            for (platform, packages) in &self.pkgx_packages {
+                let mut platform_table = toml::Table::new();
+                for (id, info) in packages {
+                    let mut pkg_table = toml::Table::new();
+                    pkg_table.insert("url".to_string(), info.url.clone().into());
+                    if let Some(checksum) = &info.checksum {
+                        pkg_table.insert("checksum".to_string(), checksum.clone().into());
+                    }
+                    if let Some(provides) = &info.pkgx_provides {
+                        pkg_table.insert(
+                            "pkgx_provides".to_string(),
+                            provides
+                                .iter()
+                                .cloned()
+                                .map(toml::Value::String)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        );
+                    }
+                    if let Some(runtime_env) = &info.pkgx_runtime_env {
+                        pkg_table.insert(
+                            "pkgx_runtime_env".to_string(),
+                            toml::Value::Table(toml_table_from_string_map(runtime_env.clone())),
+                        );
+                    }
+                    platform_table.insert(id.clone(), pkg_table.into());
+                }
+                pkgx_packages.insert(platform.clone(), platform_table.into());
+            }
+            lockfile.insert("pkgx-packages".to_string(), pkgx_packages.into());
         }
 
         // Write tools section
@@ -650,6 +865,17 @@ impl Lockfile {
         self.conda_packages.get(platform)?.get(basename)
     }
 
+    pub fn set_pkgx_package(&mut self, platform: &str, id: &str, info: PkgxPackageInfo) {
+        self.pkgx_packages
+            .entry(platform.to_string())
+            .or_default()
+            .insert(id.to_string(), info);
+    }
+
+    pub fn get_pkgx_package(&self, platform: &str, id: &str) -> Option<&PkgxPackageInfo> {
+        self.pkgx_packages.get(platform)?.get(id)
+    }
+
     /// Remove unreferenced conda packages from the shared section.
     /// A package is unreferenced if no tool's conda_deps references it.
     fn cleanup_unreferenced_conda_packages(&mut self) {
@@ -685,6 +911,36 @@ impl Lockfile {
             .retain(|_, packages| !packages.is_empty());
     }
 
+    fn cleanup_unreferenced_pkgx_packages(&mut self) {
+        let mut referenced: HashMap<String, HashSet<String>> = HashMap::new();
+        for tools in self.tools.values() {
+            for tool in tools {
+                for (platform, info) in &tool.platforms {
+                    if let Some(deps) = &info.pkgx_deps {
+                        for dep in deps {
+                            referenced
+                                .entry(platform.clone())
+                                .or_default()
+                                .insert(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (platform, packages) in &mut self.pkgx_packages {
+            let referenced_for_platform = referenced.get(platform);
+            packages.retain(|id, _| {
+                referenced_for_platform
+                    .map(|refs| refs.contains(id))
+                    .unwrap_or(false)
+            });
+        }
+
+        self.pkgx_packages
+            .retain(|_, packages| !packages.is_empty());
+    }
+
     /// Get all platform keys present in the lockfile
     pub fn all_platform_keys(&self) -> BTreeSet<String> {
         let mut platforms = BTreeSet::new();
@@ -713,6 +969,7 @@ impl Lockfile {
             Self::should_keep_tool(short, versions, keep_shorts, keep_backends)
         });
         self.cleanup_unreferenced_conda_packages();
+        self.cleanup_unreferenced_pkgx_packages();
     }
 
     /// Remove entries for a tool whose version is not in the given set.
@@ -725,6 +982,7 @@ impl Lockfile {
             }
         }
         self.cleanup_unreferenced_conda_packages();
+        self.cleanup_unreferenced_pkgx_packages();
     }
 
     /// Return versions of a tool that would be removed by `retain_tool_versions`.
@@ -797,15 +1055,31 @@ impl Lockfile {
                 let url_changed = platform_info.url.is_some()
                     && existing.url.is_some()
                     && platform_info.url != existing.url;
-                let preserve_artifact_fields = !url_changed;
-                let provenance = match (
-                    platform_info.provenance.clone(),
-                    existing.provenance.clone(),
-                ) {
-                    (Some(a), Some(b)) => Some(a.merge(b)),
-                    (a, b) => a.or(b),
+                let install_changed =
+                    platform_info.install.is_some() && platform_info.install != existing.install;
+                let source_to_url = platform_info.url.is_some()
+                    && platform_info.install.is_none()
+                    && existing.install.as_deref() == Some("source");
+                let preserve_artifact_fields = !url_changed && !install_changed && !source_to_url;
+                let provenance = if preserve_artifact_fields {
+                    match (
+                        platform_info.provenance.clone(),
+                        existing.provenance.clone(),
+                    ) {
+                        (Some(a), Some(b)) => Some(a.merge(b)),
+                        (a, b) => a.or(b),
+                    }
+                } else {
+                    platform_info.provenance.clone()
                 };
                 PlatformInfo {
+                    install: platform_info.install.or_else(|| {
+                        if platform_info.url.is_some() {
+                            None
+                        } else {
+                            existing.install.clone()
+                        }
+                    }),
                     checksum: platform_info.checksum.or_else(|| {
                         if preserve_artifact_fields {
                             existing.checksum.clone()
@@ -818,7 +1092,13 @@ impl Lockfile {
                     } else {
                         None
                     }),
-                    url: platform_info.url.or_else(|| existing.url.clone()),
+                    url: platform_info.url.or_else(|| {
+                        if preserve_artifact_fields {
+                            existing.url.clone()
+                        } else {
+                            None
+                        }
+                    }),
                     url_api: platform_info.url_api.or_else(|| {
                         if preserve_artifact_fields {
                             existing.url_api.clone()
@@ -826,9 +1106,12 @@ impl Lockfile {
                             None
                         }
                     }),
-                    // For conda_deps, always use the new value - None means "no dependencies"
+                    // For dependency lists, always use the new value - None means "no dependencies"
                     // rather than "not computed", so we shouldn't preserve stale deps
                     conda_deps: platform_info.conda_deps,
+                    pkgx_deps: platform_info.pkgx_deps,
+                    pkgx_provides: platform_info.pkgx_provides,
+                    pkgx_runtime_env: platform_info.pkgx_runtime_env,
                     provenance,
                     github_attestations: None,
                 }
@@ -892,6 +1175,44 @@ pub fn lockfile_path_for_config(config_path: &Path) -> (PathBuf, bool) {
     };
 
     (lockfile_dir.join(lockfile_name), is_local)
+}
+
+/// Determines the lockfile path for a tool source.
+///
+/// Idiomatic version files are not config files themselves, so their lock entries
+/// belong to the nearest active mise config root that contains the version file.
+/// If multiple base configs share that root, the later entry in config_files wins
+/// so colocated configs have a deterministic lockfile target, such as
+/// .mise/config.toml mapping .dummy-version to .mise/mise.lock instead of mise.lock.
+pub fn lockfile_path_for_tool_source(
+    config: &Config,
+    source: &ToolSource,
+) -> Option<(PathBuf, bool)> {
+    match source {
+        ToolSource::MiseToml(path) => Some(lockfile_path_for_config(path)),
+        ToolSource::IdiomaticVersionFile(path) => config
+            .config_files
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, cf))| cf.source().is_mise_toml())
+            .filter_map(|(idx, (config_path, cf))| {
+                let root = cf.project_root().unwrap_or_else(|| cf.config_root());
+                let is_base = !is_local_config(config_path)
+                    && extract_env_from_config_path(config_path).is_none();
+                path.starts_with(&root).then(|| {
+                    (
+                        root.components().count(),
+                        is_base,
+                        // Tie-break same-root base configs by config_files order.
+                        idx,
+                        lockfile_path_for_config(config_path),
+                    )
+                })
+            })
+            .max_by_key(|(root_depth, is_base, idx, _)| (*root_depth, *is_base, *idx))
+            .map(|(_, _, _, lockfile)| lockfile),
+        _ => None,
+    }
 }
 
 /// Checks if a config path is a "local" config (should go to mise.local.lock)
@@ -997,17 +1318,11 @@ pub fn update_lockfiles(
     // Process each lockfile, deferring provenance errors until all lockfiles are saved.
     let mut provenance_errors: Vec<String> = Vec::new();
 
-    for (lockfile_path, configs) in lockfile_configs {
+    for (lockfile_path, _configs) in lockfile_configs {
         // Only update existing lockfiles - creation is done elsewhere (e.g., by `mise lock`)
         if !lockfile_path.exists() {
             continue;
         }
-
-        trace!(
-            "updating lockfile {} from {} config files",
-            display_path(&lockfile_path),
-            configs.len()
-        );
 
         let mut existing_lockfile = Lockfile::read(&lockfile_path)
             .unwrap_or_else(|err| handle_lockfile_read_error(err, &lockfile_path));
@@ -1017,10 +1332,14 @@ pub fn update_lockfiles(
         // fuzzy request may still resolve through the old lockfile entry until
         // this update is written.
         let mut tool_versions_by_short: HashMap<String, Vec<ToolVersion>> = HashMap::new();
+        let mut contributing_sources = 0;
 
-        for config_path in &configs {
-            let tool_source = ToolSource::MiseToml(config_path.clone());
-            if let Some(tools) = tools_by_source.get(&tool_source) {
+        for (source, tools) in &tools_by_source {
+            let Some((source_lockfile, _)) = lockfile_path_for_tool_source(config, source) else {
+                continue;
+            };
+            if source_lockfile == lockfile_path {
+                contributing_sources += 1;
                 for (short, tvl) in tools {
                     tool_versions_by_short
                         .entry(short.clone())
@@ -1030,9 +1349,17 @@ pub fn update_lockfiles(
             }
         }
 
+        trace!(
+            "updating lockfile {} from {} source(s)",
+            display_path(&lockfile_path),
+            contributing_sources
+        );
+
         for new_version in new_versions {
-            if let Some(source_path) = new_version.request.source().path() {
-                if !configs.iter().any(|config| config == source_path) {
+            if let Some((source_lockfile, _)) =
+                lockfile_path_for_tool_source(config, new_version.request.source())
+            {
+                if source_lockfile != lockfile_path {
                     continue;
                 }
 
@@ -1090,15 +1417,15 @@ pub fn update_lockfiles(
         let tools_by_short: HashMap<String, Vec<LockfileTool>> = tool_versions_by_short
             .into_iter()
             .map(|(short, versions)| {
-                (
+                Ok((
                     short,
                     versions
                         .iter()
                         .map(lockfile_tool_from_tool_version)
-                        .collect(),
-                )
+                        .collect::<Result<Vec<_>>>()?,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Check for provenance regression before merging (which drops old version entries).
         // For github backend tools, error if the highest prior version had provenance but
@@ -1122,10 +1449,14 @@ pub fn update_lockfiles(
             for ((platform, basename), pkg_info) in &tv.conda_packages {
                 existing_lockfile.set_conda_package(platform, basename, pkg_info.clone());
             }
+            for ((platform, id), pkg_info) in &tv.pkgx_packages {
+                existing_lockfile.set_pkgx_package(platform, id, pkg_info.clone());
+            }
         }
 
         // Clean up any conda packages that are no longer referenced by any tool
         existing_lockfile.cleanup_unreferenced_conda_packages();
+        existing_lockfile.cleanup_unreferenced_pkgx_packages();
 
         existing_lockfile.save(&lockfile_path)?;
     }
@@ -1232,17 +1563,15 @@ fn check_provenance_regression(
 /// lockfile (existing entries are authoritative) apart from a fresh one whose only
 /// current-platform entry was just added by this install.
 pub fn snapshot_pre_install_platforms(
+    config: &Config,
     new_versions: &[ToolVersion],
 ) -> HashMap<PathBuf, BTreeSet<String>> {
     let mut result: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
     for tv in new_versions {
-        if !tv.request.source().is_mise_toml() {
-            continue;
-        }
-        let Some(source_path) = tv.request.source().path() else {
+        let Some((lockfile_path, _)) = lockfile_path_for_tool_source(config, tv.request.source())
+        else {
             continue;
         };
-        let (lockfile_path, _) = lockfile_path_for_config(source_path);
         if result.contains_key(&lockfile_path) {
             continue;
         }
@@ -1331,6 +1660,7 @@ pub fn determine_existing_platforms(lockfile_path: &Path) -> Result<Vec<Platform
 /// so the lockfile is complete and doesn't change when other developers on different
 /// platforms run `mise install`.
 pub async fn auto_lock_new_versions(
+    config: &Config,
     new_versions: &[ToolVersion],
     pre_install_platforms: &HashMap<PathBuf, BTreeSet<String>>,
     mode: LockfileUpdateMode,
@@ -1342,14 +1672,11 @@ pub async fn auto_lock_new_versions(
         return Ok(());
     }
 
-    // Group new_versions by lockfile path (only mise.toml sources, matching update_lockfiles)
+    // Group new_versions by lockfile path, matching update_lockfiles.
     let mut versions_by_lockfile: HashMap<PathBuf, Vec<&ToolVersion>> = HashMap::new();
     for tv in new_versions {
-        if !tv.request.source().is_mise_toml() {
-            continue;
-        }
-        if let Some(source_path) = tv.request.source().path() {
-            let (lockfile_path, _) = lockfile_path_for_config(source_path);
+        if let Some((lockfile_path, _)) = lockfile_path_for_tool_source(config, tv.request.source())
+        {
             versions_by_lockfile
                 .entry(lockfile_path)
                 .or_default()
@@ -1461,6 +1788,7 @@ pub type LockResolutionResult = (
     Result<PlatformInfo, String>,
     BTreeMap<String, String>,
     BTreeMap<String, CondaPackageInfo>,
+    BTreeMap<String, PkgxPackageInfo>,
 );
 
 /// Resolve lock info for a single tool/platform combination.
@@ -1475,8 +1803,22 @@ pub async fn resolve_tool_lock_info(
 ) -> LockResolutionResult {
     let target = PlatformTarget::new(platform.clone());
 
-    let (info, options, conda_packages) = if let Some(backend) = backend {
-        let options = backend.resolve_lockfile_options(&tv.request, &target);
+    let (info, options, conda_packages, pkgx_packages) = if let Some(backend) = backend {
+        let options = match backend.resolve_lockfile_options(&tv.request, &target) {
+            Ok(options) => options,
+            Err(e) => {
+                return (
+                    ba.short.clone(),
+                    tv.version.clone(),
+                    ba.stored_full(),
+                    platform,
+                    Err(e.to_string()),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                );
+            }
+        };
         match backend.resolve_lock_info(&tv, &target).await {
             Ok(info) => {
                 let conda_packages = if backend.get_type() == BackendType::Conda {
@@ -1496,7 +1838,32 @@ pub async fn resolve_tool_lock_info(
                 } else {
                     BTreeMap::new()
                 };
-                (Ok(info), options, conda_packages)
+                let pkgx_packages = if backend.get_type() == BackendType::Pkgx {
+                    let pkgx_backend = PkgxBackend::from_arg(ba.clone());
+                    match pkgx_backend.resolve_pkgx_packages(&tv, &target).await {
+                        Ok(packages) => packages,
+                        Err(e) => {
+                            return (
+                                ba.short.clone(),
+                                tv.version.clone(),
+                                ba.stored_full(),
+                                platform,
+                                Err(format!(
+                                    "failed to resolve pkgx packages for {} on {}: {}",
+                                    ba.short,
+                                    target.to_key(),
+                                    e
+                                )),
+                                options,
+                                BTreeMap::new(),
+                                BTreeMap::new(),
+                            );
+                        }
+                    }
+                } else {
+                    BTreeMap::new()
+                };
+                (Ok(info), options, conda_packages, pkgx_packages)
             }
             Err(e) => (
                 Err(format!(
@@ -1507,11 +1874,13 @@ pub async fn resolve_tool_lock_info(
                 )),
                 options,
                 BTreeMap::new(),
+                BTreeMap::new(),
             ),
         }
     } else {
         (
             Err(format!("backend not found for {}", ba.short)),
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
         )
@@ -1525,6 +1894,7 @@ pub async fn resolve_tool_lock_info(
         info,
         options,
         conda_packages,
+        pkgx_packages,
     )
 }
 
@@ -1534,7 +1904,7 @@ pub async fn resolve_tool_lock_info(
 /// Returns an error if a github backend tool loses provenance on version upgrade,
 /// which could indicate a supply chain attack.
 pub fn apply_lock_result(lockfile: &mut Lockfile, result: LockResolutionResult) -> Result<()> {
-    let (short, version, backend, platform, info, options, conda_packages) = result;
+    let (short, version, backend, platform, info, options, conda_packages, pkgx_packages) = result;
     let platform_key = platform.to_key();
     if let Ok(ref info) = info {
         if let Some(err) = check_single_tool_provenance(
@@ -1558,6 +1928,9 @@ pub fn apply_lock_result(lockfile: &mut Lockfile, result: LockResolutionResult) 
     }
     for (basename, pkg_info) in conda_packages {
         lockfile.set_conda_package(&platform_key, &basename, pkg_info);
+    }
+    for (id, pkg_info) in pkgx_packages {
+        lockfile.set_pkgx_package(&platform_key, &id, pkg_info);
     }
     Ok(())
 }
@@ -1638,11 +2011,13 @@ fn read_all_lockfiles(config: &Config) -> Arc<Lockfile> {
         seen_roots.insert(root.clone());
 
         // Read lockfiles in priority order (highest first):
-        // 1. mise.<env>.local.lock (if MISE_ENV is set)
+        // 1. mise.<env>.local.lock (explicit MISE_ENV, then auto platform envs)
         // 2. mise.local.lock
-        // 3. mise.<env>.lock (if MISE_ENV is set)
+        // 3. mise.<env>.lock (explicit MISE_ENV, then auto platform envs)
         // 4. mise.lock
-        for env_name in env::MISE_ENV.iter() {
+        // AUTO_ENV_NAMES is ordered least to most specific, so reverse it here
+        // to read the most specific (e.g. macos-arm64) first.
+        for env_name in env::MISE_ENV.iter().chain(env::AUTO_ENV_NAMES.iter().rev()) {
             let p = root.join(format!("mise.{env_name}.local.lock"));
             if let Ok(l) = Lockfile::read(&p) {
                 all.push(l);
@@ -1652,7 +2027,7 @@ fn read_all_lockfiles(config: &Config) -> Arc<Lockfile> {
         if let Ok(local) = Lockfile::read(&local_path) {
             all.push(local);
         }
-        for env_name in env::MISE_ENV.iter() {
+        for env_name in env::MISE_ENV.iter().chain(env::AUTO_ENV_NAMES.iter().rev()) {
             let p = root.join(format!("mise.{env_name}.lock"));
             if let Ok(l) = Lockfile::read(&p) {
                 all.push(l);
@@ -1938,16 +2313,7 @@ impl LockfileTool {
     }
 }
 
-impl From<ToolVersionList> for Vec<LockfileTool> {
-    fn from(tvl: ToolVersionList) -> Self {
-        tvl.versions
-            .iter()
-            .map(lockfile_tool_from_tool_version)
-            .collect()
-    }
-}
-
-fn lockfile_tool_from_tool_version(tv: &ToolVersion) -> LockfileTool {
+fn lockfile_tool_from_tool_version(tv: &ToolVersion) -> Result<LockfileTool> {
     let mut platforms = BTreeMap::new();
 
     // Convert tool version lock_platforms to lockfile platforms
@@ -1958,17 +2324,17 @@ fn lockfile_tool_from_tool_version(tv: &ToolVersion) -> LockfileTool {
     // Resolve lockfile options from the backend
     let options = if let Ok(backend) = tv.request.backend() {
         let target = PlatformTarget::from_current();
-        backend.resolve_lockfile_options(&tv.request, &target)
+        backend.resolve_lockfile_options(&tv.request, &target)?
     } else {
         BTreeMap::new()
     };
 
-    LockfileTool {
+    Ok(LockfileTool {
         version: tv.version.clone(),
         backend: Some(tv.ba().stored_full()),
         options,
         platforms,
-    }
+    })
 }
 
 fn format(mut doc: DocumentMut) -> String {
@@ -2745,6 +3111,26 @@ backend = "conda:jq"
     }
 
     #[test]
+    fn test_platform_info_merge_clears_stale_source_marker_on_url() {
+        let new_info = PlatformInfo {
+            checksum: Some("sha256:NEW".to_string()),
+            url: Some("https://example.com/v2.tar.gz".to_string()),
+            ..Default::default()
+        };
+        let stale_source = PlatformInfo {
+            install: Some("source".to_string()),
+            checksum: Some("sha256:OLD".to_string()),
+            url: Some("https://example.com/source.tar.gz".to_string()),
+            ..Default::default()
+        };
+
+        let merged = new_info.merge_with(&stale_source);
+        assert_eq!(merged.install, None);
+        assert_eq!(merged.url.as_deref(), Some("https://example.com/v2.tar.gz"));
+        assert_eq!(merged.checksum.as_deref(), Some("sha256:NEW"));
+    }
+
+    #[test]
     fn test_provenance_fields_roundtrip() {
         let info = PlatformInfo {
             checksum: Some("sha256:abc123".to_string()),
@@ -3065,6 +3451,124 @@ backend = "conda:jq"
             }
             other => panic!("expected Slsa provenance with URL, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_set_platform_info_replaces_artifact_with_source_outcome() {
+        let mut lockfile = Lockfile::default();
+        lockfile.set_platform_info(
+            "node",
+            "24.0.0",
+            Some("core:node"),
+            &BTreeMap::new(),
+            "linux-x64",
+            PlatformInfo {
+                checksum: Some("sha256:OLD".to_string()),
+                size: Some(123),
+                url: Some("https://example.com/binary.tar.gz".to_string()),
+                url_api: Some("https://api.example.com/binary".to_string()),
+                ..Default::default()
+            },
+        );
+        lockfile.set_platform_info(
+            "node",
+            "24.0.0",
+            Some("core:node"),
+            &BTreeMap::new(),
+            "linux-x64",
+            PlatformInfo {
+                install: Some("source".to_string()),
+                checksum: Some("sha256:NEW".to_string()),
+                url: Some("https://example.com/source.tar.gz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let info = &lockfile.tools["node"][0].platforms["linux-x64"];
+        assert_eq!(info.install.as_deref(), Some("source"));
+        assert_eq!(info.checksum.as_deref(), Some("sha256:NEW"));
+        assert_eq!(info.size, None);
+        assert_eq!(
+            info.url.as_deref(),
+            Some("https://example.com/source.tar.gz")
+        );
+        assert_eq!(info.url_api, None);
+    }
+
+    #[test]
+    fn test_set_platform_info_replaces_source_outcome_with_artifact() {
+        let mut lockfile = Lockfile::default();
+        lockfile.set_platform_info(
+            "node",
+            "24.0.0",
+            Some("core:node"),
+            &BTreeMap::new(),
+            "linux-x64",
+            PlatformInfo {
+                install: Some("source".to_string()),
+                checksum: Some("sha256:OLD".to_string()),
+                url: Some("https://example.com/source.tar.gz".to_string()),
+                ..Default::default()
+            },
+        );
+        lockfile.set_platform_info(
+            "node",
+            "24.0.0",
+            Some("core:node"),
+            &BTreeMap::new(),
+            "linux-x64",
+            PlatformInfo {
+                checksum: Some("sha256:NEW".to_string()),
+                url: Some("https://example.com/binary.tar.gz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let info = &lockfile.tools["node"][0].platforms["linux-x64"];
+        assert_eq!(info.install, None);
+        assert_eq!(info.checksum.as_deref(), Some("sha256:NEW"));
+        assert_eq!(
+            info.url.as_deref(),
+            Some("https://example.com/binary.tar.gz")
+        );
+    }
+
+    #[test]
+    fn test_source_platform_info_serializes_as_lock_marker() {
+        let mut lockfile = Lockfile::default();
+        lockfile.set_platform_info(
+            "node",
+            "24.0.0",
+            Some("core:node"),
+            &BTreeMap::new(),
+            "linux-riscv64",
+            PlatformInfo {
+                install: Some("source".to_string()),
+                checksum: Some("sha256:SOURCE".to_string()),
+                url: Some("https://example.com/node-v24.0.0.tar.gz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_lockfile = temp_dir.path().join("source-platform-marker.lock");
+        lockfile.write(&test_lockfile).unwrap();
+        let serialized = file::read_to_string(&test_lockfile).unwrap();
+
+        assert!(serialized.contains("platforms.linux-riscv64"));
+        assert!(serialized.contains("install = \"source\""));
+        assert!(serialized.contains("checksum = \"sha256:SOURCE\""));
+        assert!(serialized.contains("url = \"https://example.com/node-v24.0.0.tar.gz\""));
+        assert!(!serialized.contains("node-v24.0.0-linux-riscv64.tar.gz"));
+
+        let reloaded = Lockfile::read(&test_lockfile).unwrap();
+        let info = &reloaded.tools["node"][0].platforms["linux-riscv64"];
+        assert_eq!(info.install.as_deref(), Some("source"));
+        assert_eq!(info.checksum.as_deref(), Some("sha256:SOURCE"));
+        assert_eq!(
+            info.url.as_deref(),
+            Some("https://example.com/node-v24.0.0.tar.gz")
+        );
     }
 
     #[test]

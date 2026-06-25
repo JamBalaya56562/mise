@@ -6,15 +6,15 @@ use crate::env_diff::{EnvDiff, EnvDiffOperation, EnvMap};
 use crate::file::{canonicalize_cached, display_rel_path};
 use crate::hook_env::{PREV_SESSION, WatchFilePattern};
 use crate::shell::{ShellType, get_shell};
-use crate::toolset::Toolset;
-use crate::{dirs, env, hook_env, hooks, watch_files};
+use crate::toolset::{ResolveOptions, Toolset, ToolsetBuilder};
+use crate::{env, exit, hook_env, hooks, watch_files};
 use console::truncate_str;
 use eyre::Result;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::{borrow::Cow, sync::Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -51,8 +51,33 @@ pub struct HookEnv {
 
 impl HookEnv {
     pub async fn run(self) -> Result<()> {
-        let config = Config::get().await?;
-        let ts = config.get_toolset().await?;
+        let shell = get_shell(self.shell).expect("no shell provided, use `--shell=zsh`");
+        let config = match Config::get().await {
+            Ok(config) => config,
+            Err(err) => {
+                let Some(config_path) = hook_env::untrusted_config_error_path(&err) else {
+                    return Err(err);
+                };
+                if hook_env::should_show_untrusted_config_warning(&config_path) {
+                    if let Err(mark_err) =
+                        hook_env::mark_untrusted_config_warning_seen(&*shell, &config_path)
+                    {
+                        trace!("failed to mark untrusted config warning seen: {mark_err}");
+                    }
+                    return Err(err);
+                }
+                exit(1);
+            }
+        };
+        // Shell activation must stay fast and non-networked; missing tools are
+        // handled by the normal install paths instead of hook-env.
+        let ts = ToolsetBuilder::new()
+            .with_resolve_options(ResolveOptions {
+                offline: true,
+                ..Default::default()
+            })
+            .build(&config)
+            .await?;
         time!("hook-env");
 
         // Try to use cached watch_files for early exit check if env_cache is enabled
@@ -86,7 +111,6 @@ impl HookEnv {
             return Ok(());
         }
         time!("should_exit_early false");
-        let shell = get_shell(self.shell).expect("no shell provided, use `--shell=zsh`");
         miseprint!("{}", hook_env::clear_old_env(&*shell))?;
 
         // Use env_with_path_and_split which handles caching internally
@@ -96,7 +120,7 @@ impl HookEnv {
 
         // Create config_paths from user_paths for display_status and build_session
         let config_paths: IndexSet<PathBuf> = user_paths.iter().cloned().collect();
-        self.display_status(&config, ts, &mise_env, &config_paths)
+        self.display_status(&config, &ts, &mise_env, &config_paths)
             .await?;
 
         let mut diff = EnvDiff::new(&env::PRISTINE_ENV, mise_env.clone());
@@ -142,7 +166,7 @@ impl HookEnv {
         patches.push(
             self.build_session_operation(
                 &config,
-                ts,
+                &ts,
                 mise_env,
                 new_aliases.clone(),
                 watch_files,
@@ -158,6 +182,7 @@ impl HookEnv {
                 "1".into(),
             ));
         }
+        hook_env::clear_untrusted_config_warning(&mut patches);
 
         let output = hook_env::build_env_commands(&*shell, &patches);
         miseprint!("{output}")?;
@@ -167,9 +192,9 @@ impl HookEnv {
             hook_env::build_alias_commands(&*shell, &PREV_SESSION.aliases, &new_aliases);
         miseprint!("{alias_output}")?;
 
-        hooks::run_all_hooks(&config, ts, &*shell).await;
-        hooks::run_enter_hooks_for_newly_loaded_configs(&config, ts, &*shell).await;
-        watch_files::execute_runs(&config, ts).await;
+        hooks::run_all_hooks(&config, &ts, &*shell).await;
+        hooks::run_enter_hooks_for_newly_loaded_configs(&config, &ts, &*shell).await;
+        watch_files::execute_runs(&config, &ts).await;
 
         Ok(())
     }
@@ -274,6 +299,7 @@ impl HookEnv {
                 let mut orig_reordered = Vec::new();
                 let mut seen_orig = false;
                 let mut seen_in_current: HashSet<&PathBuf> = HashSet::new();
+                let mise_install_dirs = crate::path_env::mise_install_dirs();
                 for path in &current_paths {
                     if orig_set.contains(path) {
                         seen_orig = true;
@@ -291,7 +317,7 @@ impl HookEnv {
                     // the previous session diff did not claim them. Preserving a
                     // stale install path as a user prefix can shadow the active
                     // version selected by the current toolset.
-                    if is_mise_install_path(path) {
+                    if crate::path_env::is_mise_install_path(path, &mise_install_dirs) {
                         continue;
                     }
 
@@ -503,17 +529,6 @@ impl HookEnv {
             hook_env::serialize(&session)?,
         ))
     }
-}
-
-fn is_mise_install_path(path: &Path) -> bool {
-    if path.starts_with(*dirs::INSTALLS) {
-        return true;
-    }
-
-    let Some(path) = canonicalize_cached(path) else {
-        return false;
-    };
-    canonicalize_cached(*dirs::INSTALLS).is_some_and(|installs| path.starts_with(installs))
 }
 
 fn patch_to_status(patch: EnvDiffOperation) -> String {

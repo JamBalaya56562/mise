@@ -209,8 +209,8 @@ impl Toolset {
             mpr.footer_finish();
         }
 
-        // Skip hooks in dry-run mode
-        if !opts.dry_run {
+        // Skip hooks in dry-run mode, and when nothing was actually installed (#10574)
+        if !opts.dry_run && !installed.is_empty() {
             // Run post-install hook with installed tools info
             // Use the full resolved toolset so all installed tools are on PATH
             // Fall back to self if toolset resolution fails (e.g. due to config issues)
@@ -477,7 +477,7 @@ impl Toolset {
             let tool_dir_name = tv.ba().tool_dir_name();
             tv.install_path = Some(dir.join(tool_dir_name).join(tv.tv_pathname()));
         }
-        let before_date = tv.before_date;
+        let before_date = transitive_dependency_before_date(tr, &tv);
 
         let ctx = InstallContext {
             config: config.clone(),
@@ -633,5 +633,18 @@ fn should_refresh_remote_versions(
         }
         ToolRequest::Sub { orig_version, .. } => orig_version == "latest",
         ToolRequest::Ref { .. } | ToolRequest::Path { .. } | ToolRequest::System { .. } => false,
+    }
+}
+
+fn transitive_dependency_before_date(
+    tr: &ToolRequest,
+    tv: &ToolVersion,
+) -> Option<jiff::Timestamp> {
+    match tr {
+        ToolRequest::Version { version, .. } if version != "latest" && version == &tv.version => {
+            None
+        }
+        ToolRequest::Ref { .. } | ToolRequest::Path { .. } | ToolRequest::System { .. } => None,
+        _ => tv.before_date,
     }
 }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::backend::configured_toolset_or_path_which;
 use crate::config::{Config, Settings};
 use crate::env;
 use crate::file::replace_path;
@@ -24,6 +25,13 @@ where
     static AGE_KEY: OnceCell<Option<String>> = OnceCell::const_new();
     static AGE_KEY_FILE: OnceCell<Option<std::path::PathBuf>> = OnceCell::const_new();
     static MUTEX: Mutex<()> = Mutex::const_new(());
+
+    let use_rops = Settings::get().sops.rops;
+    if !use_rops && format == "toml" {
+        return Err(eyre!(
+            "sops.rops=false is not supported for TOML SOPS files because the sops CLI does not support TOML; set sops.rops=true or use a JSON/YAML SOPS file"
+        ));
+    }
 
     let age = AGE_KEY
         .get_or_init(async || {
@@ -126,11 +134,7 @@ where
     }
 
     let _lock = MUTEX.lock().await; // prevent multiple threads from using the same age key
-    let age_env_key = if Settings::get().sops.rops {
-        "ROPS_AGE"
-    } else {
-        "SOPS_AGE_KEY"
-    };
+    let age_env_key = if use_rops { "ROPS_AGE" } else { "SOPS_AGE_KEY" };
     let prev_age = env::var(age_env_key).ok();
     let prev_age_key_file = env::var("SOPS_AGE_KEY_FILE").ok();
 
@@ -145,7 +149,7 @@ where
     if let Some(age) = &age {
         env::set_var(age_env_key, age.trim());
     }
-    let output = if Settings::get().sops.rops {
+    let output = if use_rops {
         match input
             .parse::<RopsFile<EncryptedFile<AES256GCM, SHA512>, F>>()
             .wrap_err("failed to parse sops file")
@@ -175,15 +179,8 @@ where
             }
         }
     } else {
-        let mut ts = config
-            .get_tool_request_set()
-            .await
-            .cloned()
-            .unwrap_or_default()
-            .filter_by_tool(["sops".into()].into())
-            .into_toolset();
-        Box::pin(ts.resolve(config)).await?;
-        let sops_path = ts.which_bin(config, "sops").await;
+        let sops_path =
+            configured_toolset_or_path_which(config, ["sops".to_string()], "sops").await?;
 
         match sops_path {
             None => {

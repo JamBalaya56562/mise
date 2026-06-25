@@ -13,7 +13,7 @@ use crate::config::settings::NpmPackageManager;
 use crate::config::{Config, Settings};
 use crate::duration::{elapsed_seconds_ceil, process_now};
 use crate::install_context::InstallContext;
-use crate::semver::{semver_is_at_least, semver_is_older_than, semver_triplet};
+use crate::semver::{semver_is_at_least, semver_is_older_than};
 use crate::timeout;
 use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset};
 use async_trait::async_trait;
@@ -224,9 +224,9 @@ impl Backend for NPMBackend {
         &self,
         request: &ToolRequest,
         _target: &PlatformTarget,
-    ) -> BTreeMap<String, String> {
+    ) -> Result<BTreeMap<String, String>> {
         let opts = request.options();
-        NpmOptions::new(&opts).lockfile_options()
+        Ok(NpmOptions::new(&opts).lockfile_options())
     }
 
     async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
@@ -331,7 +331,7 @@ impl Backend for NPMBackend {
             NpmPackageManager::Auto => unreachable!("auto package manager should be resolved"),
             NpmPackageManager::Aube => {
                 let aube_program = self
-                    .aube_path_for_install(&ctx.config, Some(&ctx.ts))
+                    .dependency_path_for_install(&ctx.config, Some(&ctx.ts), AUBE_PROGRAM)
                     .await
                     .unwrap_or_else(|| AUBE_PROGRAM.into());
                 self.write_aube_npmrc(&tv.install_path(), ctx.before_date)?;
@@ -416,6 +416,8 @@ impl Backend for NPMBackend {
                 cmd.execute()?;
             }
             _ => {
+                let npm_args = options.npm_args().map(shell_words::split).transpose()?;
+                let skipped_lifecycle_scripts = Self::effective_npm_ignore_scripts(&npm_args);
                 let mut cmd = CmdLineRunner::new(NPM_PROGRAM)
                     .arg("install")
                     .arg("-g")
@@ -435,10 +437,13 @@ impl Backend for NPMBackend {
                             .await,
                     )?;
                 cmd = cmd.arg(NPM_IGNORE_SCRIPTS_ARG);
-                if let Some(args) = options.npm_args() {
-                    cmd = cmd.args(shell_words::split(args)?);
+                if let Some(args) = &npm_args {
+                    cmd = cmd.args(args);
                 }
                 cmd.execute()?;
+                if skipped_lifecycle_scripts {
+                    self.warn_if_npm_package_lifecycle_scripts_skipped(&tv);
+                }
             }
         }
         Ok(tv)
@@ -532,15 +537,16 @@ impl NPMBackend {
             return;
         };
 
-        let version = match Self::toolset_package_manager_version(&ctx.ts, tool) {
-            Some(version) => Some(version),
-            None => match self.dependency_toolset(&ctx.config).await {
-                Ok(ts) => Self::toolset_package_manager_version(&ts, tool),
-                Err(_) => None,
-            },
-        };
-
-        let Some(version) = version else {
+        let Some(version) =
+            crate::backend::semver_version_from_toolsets_or_path(self, &ctx.config, &ctx.ts, tool)
+                .await
+        else {
+            warn!(
+                "minimum_release_age is set for npm:{} but could not determine {} version required to verify {} support. Release-age filtering for transitive dependencies may not work as expected. See https://mise.en.dev/dev-tools/backends/npm.html",
+                self.tool_name(),
+                tool,
+                flag
+            );
             return;
         };
 
@@ -573,27 +579,6 @@ impl NPMBackend {
                 "--config.minimumReleaseAge",
             )),
         }
-    }
-
-    fn toolset_package_manager_version(ts: &Toolset, tool: &str) -> Option<String> {
-        let tvl = ts
-            .versions
-            .iter()
-            .find(|(ba, _)| ba.short == tool)
-            .map(|(_, tvl)| tvl)?;
-
-        if let Some(tv) = tvl
-            .versions
-            .iter()
-            .find(|tv| semver_triplet(&tv.version).is_some())
-        {
-            return Some(tv.version.clone());
-        }
-
-        tvl.requests
-            .iter()
-            .map(|tr| tr.version())
-            .find(|version| semver_triplet(version).is_some())
     }
 
     /// Detect whether the locally installed npm supports --min-release-age.
@@ -744,20 +729,9 @@ impl NPMBackend {
     }
 
     async fn aube_is_installed(&self, config: &Arc<Config>, ts: Option<&Toolset>) -> bool {
-        self.aube_path_for_install(config, ts).await.is_some()
-    }
-
-    async fn aube_path_for_install(
-        &self,
-        config: &Arc<Config>,
-        ts: Option<&Toolset>,
-    ) -> Option<std::path::PathBuf> {
-        if let Some(ts) = ts
-            && let Some(bin) = ts.which_bin(config, AUBE_PROGRAM).await
-        {
-            return Some(bin);
-        }
-        self.dependency_which(config, AUBE_PROGRAM).await
+        self.dependency_path_for_install(config, ts, AUBE_PROGRAM)
+            .await
+            .is_some()
     }
 
     fn write_aube_npmrc(&self, install_path: &Path, before_date: Option<Timestamp>) -> Result<()> {
@@ -789,6 +763,88 @@ impl NPMBackend {
         seconds.div_ceil(60)
     }
 
+    fn effective_npm_ignore_scripts(args: &Option<Vec<String>>) -> bool {
+        let Some(args) = args else {
+            return true;
+        };
+        let mut ignore_scripts = true;
+        let mut iter = args.iter().peekable();
+        while let Some(arg) = iter.next() {
+            if arg == "--ignore-scripts" {
+                if let Some(value) = iter.peek().and_then(|next| parse_bool_arg(next)) {
+                    ignore_scripts = value;
+                    iter.next();
+                } else {
+                    ignore_scripts = true;
+                }
+            } else if arg == "--no-ignore-scripts" {
+                ignore_scripts = false;
+            } else if let Some(value) = arg.strip_prefix("--ignore-scripts=")
+                && let Some(value) = parse_bool_arg(value)
+            {
+                ignore_scripts = value;
+            }
+        }
+        ignore_scripts
+    }
+
+    fn warn_if_npm_package_lifecycle_scripts_skipped(&self, tv: &ToolVersion) {
+        let tool_name = self.tool_name();
+        let Some((package_json_path, hooks)) =
+            Self::installed_package_lifecycle_scripts(&tv.install_path(), &tool_name)
+        else {
+            return;
+        };
+        warn!(
+            "{}@{} declares npm lifecycle script(s) ({}) in {}, but mise skipped them with {}. Review the package before opting in with `npm_args = \"--ignore-scripts=false\"`.",
+            self.ba().full(),
+            tv.version,
+            hooks.join(", "),
+            package_json_path.display(),
+            NPM_IGNORE_SCRIPTS_ARG
+        );
+    }
+
+    fn installed_package_lifecycle_scripts(
+        install_path: &Path,
+        package_name: &str,
+    ) -> Option<(std::path::PathBuf, Vec<&'static str>)> {
+        for node_modules in [
+            install_path.join("lib").join("node_modules"),
+            install_path.join("node_modules"),
+        ] {
+            let package_json_path = node_modules.join(package_name).join("package.json");
+            let hooks = Self::lifecycle_scripts_from_package_json(&package_json_path);
+            if !hooks.is_empty() {
+                return Some((package_json_path, hooks));
+            }
+        }
+        None
+    }
+
+    fn lifecycle_scripts_from_package_json(package_json_path: &Path) -> Vec<&'static str> {
+        // `prepare` does not run for versioned registry installs, which are what
+        // the npm backend performs.
+        const LIFECYCLE_SCRIPTS: &[&str] = &["preinstall", "install", "postinstall"];
+        let Ok(package_json) = std::fs::read_to_string(package_json_path) else {
+            return vec![];
+        };
+        let Ok(package_json) = serde_json::from_str::<serde_json::Value>(&package_json) else {
+            return vec![];
+        };
+        let Some(scripts) = package_json
+            .get("scripts")
+            .and_then(|scripts| scripts.as_object())
+        else {
+            return vec![];
+        };
+        LIFECYCLE_SCRIPTS
+            .iter()
+            .filter(|script| scripts.contains_key(**script))
+            .copied()
+            .collect()
+    }
+
     #[cfg(any(windows, test))]
     fn windows_bin_paths_for_install_path(install_path: &Path) -> Vec<std::path::PathBuf> {
         let bin_dir = install_path.join("bin");
@@ -815,6 +871,14 @@ fn is_semver_prerelease(version: &str) -> bool {
     core_and_pre.contains('-')
 }
 
+fn parse_bool_arg(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Returns install-time-only option keys for NPM backend.
 pub fn install_time_option_keys() -> Vec<String> {
     vec![
@@ -830,9 +894,8 @@ pub fn install_time_option_keys() -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cli::args::{BackendArg, BackendResolution};
-    use crate::toolset::{ToolRequest, ToolSource, ToolVersionList, ToolVersionOptions};
+    use crate::toolset::{ToolRequest, ToolSource, ToolVersionOptions};
     use pretty_assertions::assert_eq;
-    use std::sync::Arc;
 
     fn create_npm_backend(tool: &str) -> NPMBackend {
         let ba = BackendArg::new_raw(
@@ -843,25 +906,6 @@ mod tests {
             BackendResolution::new(true),
         );
         NPMBackend::from_arg(ba)
-    }
-
-    fn create_test_backend_arg(tool: &str) -> Arc<BackendArg> {
-        Arc::new(BackendArg::new_raw(
-            tool.to_string(),
-            None,
-            tool.to_string(),
-            None,
-            BackendResolution::new(true),
-        ))
-    }
-
-    fn create_test_tool_request(ba: Arc<BackendArg>, version: &str) -> ToolRequest {
-        ToolRequest::Version {
-            backend: ba,
-            version: version.to_string(),
-            options: ToolVersionOptions::default(),
-            source: ToolSource::Argument,
-        }
     }
 
     #[test]
@@ -998,6 +1042,69 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_npm_ignore_scripts_defaults_to_true() {
+        assert!(NPMBackend::effective_npm_ignore_scripts(&None));
+    }
+
+    #[test]
+    fn test_effective_npm_ignore_scripts_honors_later_false_arg() {
+        assert!(!NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts=false".into()
+        ])));
+        assert!(!NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts=0".into()
+        ])));
+        assert!(!NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts".into(),
+            "false".into()
+        ])));
+        assert!(!NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts".into(),
+            "0".into()
+        ])));
+        assert!(!NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--no-ignore-scripts".into()
+        ])));
+    }
+
+    #[test]
+    fn test_effective_npm_ignore_scripts_later_arg_wins() {
+        assert!(NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts=false".into(),
+            "--ignore-scripts=true".into()
+        ])));
+        assert!(NPMBackend::effective_npm_ignore_scripts(&Some(vec![
+            "--ignore-scripts".into(),
+            "false".into(),
+            "--ignore-scripts".into(),
+            "1".into()
+        ])));
+    }
+
+    #[test]
+    fn test_lifecycle_scripts_from_package_json_finds_install_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package_json_path = tmp.path().join("package.json");
+        std::fs::write(
+            &package_json_path,
+            r#"{
+                "scripts": {
+                    "test": "node test.js",
+                    "preinstall": "node preinstall.js",
+                    "prepare": "node prepare.js",
+                    "postinstall": "node postinstall.js"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            NPMBackend::lifecycle_scripts_from_package_json(&package_json_path),
+            vec!["preinstall", "postinstall"]
+        );
+    }
+
+    #[test]
     fn test_release_age_package_manager_requirements() {
         assert_eq!(
             NPMBackend::release_age_package_manager_requirement(NpmPackageManager::Auto),
@@ -1039,56 +1146,6 @@ mod tests {
     }
 
     #[test]
-    fn test_toolset_package_manager_version_prefers_resolved_version() {
-        let ba = create_test_backend_arg("bun");
-        let request = create_test_tool_request(ba.clone(), "1.2.0");
-        let mut tvl = ToolVersionList::new(ba.clone(), ToolSource::Argument);
-        tvl.requests.push(request.clone());
-        tvl.versions
-            .push(ToolVersion::new(request, "1.3.0".to_string()));
-
-        let mut ts = Toolset::default();
-        ts.versions.insert(ba, tvl);
-
-        assert_eq!(
-            NPMBackend::toolset_package_manager_version(&ts, "bun"),
-            Some("1.3.0".to_string())
-        );
-    }
-
-    #[test]
-    fn test_toolset_package_manager_version_uses_exact_request() {
-        let ba = create_test_backend_arg("pnpm");
-        let request = create_test_tool_request(ba.clone(), "10.15.0");
-        let mut tvl = ToolVersionList::new(ba.clone(), ToolSource::Argument);
-        tvl.requests.push(request);
-
-        let mut ts = Toolset::default();
-        ts.versions.insert(ba, tvl);
-
-        assert_eq!(
-            NPMBackend::toolset_package_manager_version(&ts, "pnpm"),
-            Some("10.15.0".to_string())
-        );
-    }
-
-    #[test]
-    fn test_toolset_package_manager_version_ignores_unresolved_request() {
-        let ba = create_test_backend_arg("pnpm");
-        let request = create_test_tool_request(ba.clone(), "10");
-        let mut tvl = ToolVersionList::new(ba.clone(), ToolSource::Argument);
-        tvl.requests.push(request);
-
-        let mut ts = Toolset::default();
-        ts.versions.insert(ba, tvl);
-
-        assert_eq!(
-            NPMBackend::toolset_package_manager_version(&ts, "pnpm"),
-            None
-        );
-    }
-
-    #[test]
     fn test_resolve_lockfile_options_includes_install_args_only() {
         let backend = create_npm_backend("react-devtools");
         let mut options = ToolVersionOptions::default();
@@ -1120,7 +1177,9 @@ mod tests {
         let request =
             ToolRequest::new_opts(backend.ba().clone(), "latest", options, ToolSource::Unknown)
                 .unwrap();
-        let resolved = backend.resolve_lockfile_options(&request, &PlatformTarget::from_current());
+        let resolved = backend
+            .resolve_lockfile_options(&request, &PlatformTarget::from_current())
+            .unwrap();
         assert_eq!(
             resolved.get("npm_args"),
             Some(&"--ignore-scripts=false".to_string())

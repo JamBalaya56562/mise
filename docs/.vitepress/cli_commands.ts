@@ -25,6 +25,168 @@ export const commands: { [key: string]: Command } = {
   "bin-paths": {
     hide: false,
   },
+  bootstrap: {
+    hide: false,
+    subcommands: {
+      dotfiles: {
+        hide: false,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      launchd: {
+        hide: true,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      linux: {
+        hide: false,
+        subcommands: {
+          "systemd-units": {
+            hide: false,
+            subcommands: {
+              apply: {
+                hide: false,
+              },
+              status: {
+                hide: false,
+              },
+            },
+          },
+        },
+      },
+      macos: {
+        hide: false,
+        subcommands: {
+          defaults: {
+            hide: false,
+            subcommands: {
+              apply: {
+                hide: false,
+              },
+              status: {
+                hide: false,
+              },
+            },
+          },
+          "launchd-agents": {
+            hide: false,
+            subcommands: {
+              apply: {
+                hide: false,
+              },
+              status: {
+                hide: false,
+              },
+            },
+          },
+        },
+      },
+      "macos-defaults": {
+        hide: true,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      "mise-shell-activate": {
+        hide: false,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      packages: {
+        hide: false,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          brew: {
+            hide: false,
+            subcommands: {
+              tap: {
+                hide: false,
+              },
+              untap: {
+                hide: false,
+              },
+            },
+          },
+          import: {
+            hide: false,
+          },
+          prune: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+          upgrade: {
+            hide: false,
+          },
+          use: {
+            hide: false,
+          },
+        },
+      },
+      repos: {
+        hide: false,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      status: {
+        hide: false,
+      },
+      systemd: {
+        hide: true,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+      user: {
+        hide: false,
+        subcommands: {
+          apply: {
+            hide: false,
+          },
+          status: {
+            hide: false,
+          },
+        },
+      },
+    },
+  },
   cache: {
     hide: false,
     subcommands: {
@@ -94,6 +256,23 @@ export const commands: { [key: string]: Command } = {
     hide: false,
     subcommands: {
       path: {
+        hide: false,
+      },
+    },
+  },
+  dotfiles: {
+    hide: false,
+    subcommands: {
+      add: {
+        hide: false,
+      },
+      apply: {
+        hide: false,
+      },
+      edit: {
+        hide: false,
+      },
+      status: {
         hide: false,
       },
     },
@@ -295,6 +474,9 @@ export const commands: { [key: string]: Command } = {
         hide: false,
       },
     },
+  },
+  sponsors: {
+    hide: false,
   },
   sync: {
     hide: false,

@@ -1,4 +1,4 @@
-# Hooks <Badge type="warning" text="experimental" />
+# Hooks
 
 You can have mise automatically execute scripts during a `mise activate` session. You cannot use these
 without the `mise activate` shell hook installed in your shell—except the `preinstall` and `postinstall` hooks.
@@ -6,7 +6,7 @@ The configuration goes into `mise.toml`.
 
 ## CD hook
 
-This hook is run anytimes the directory is changed.
+This hook is run anytime the directory is changed.
 
 ```toml
 [hooks]
@@ -48,9 +48,20 @@ String hooks are shorthand for `run` hooks. Use a hook table when you need to se
 postinstall = { run = "echo 'installed'", shell = "bash -c" }
 ```
 
+Like tasks, inline hook tables may define a Windows-specific command with `run_windows`.
+On Windows, mise uses `run_windows` when it is set; otherwise it uses `run`. On other
+platforms, a hook with only `run_windows` is skipped.
+
+```toml
+[hooks]
+postinstall = { run = "echo installed", run_windows = "Write-Output installed" }
+```
+
 For `preinstall` and `postinstall`, `script = ...` is a legacy alias for `run = ...`. If a `shell` is also set on a `script`/`scripts` hook, mise warns that the shell is ignored and still runs the script with the default inline shell. Use `run = ...` with `shell = "bash -c"` to choose the inline shell command. The `script` alias for install hooks is deprecated.
 
-The `postinstall` hook receives a `MISE_INSTALLED_TOOLS` environment variable containing a JSON array of the tools that were just installed:
+The `postinstall` hook only runs when at least one tool was actually installed. If everything is already installed (`mise install` reports "all tools are installed"), the hook is skipped.
+
+When it does run, the `postinstall` hook receives a `MISE_INSTALLED_TOOLS` environment variable containing a JSON array of the tools that were just installed:
 
 ```toml
 [hooks]
@@ -149,7 +160,7 @@ Hooks are executed with the following environment variables set:
 Inline `run` hooks can be written as `{ run = "..." }` for any hook type. The string shorthand
 (`enter = "echo hi"`) is equivalent to `{ run = "echo hi" }`.
 
-`run` must be a string. `run = ["echo one", "echo two"]` is not supported.
+`run` and `run_windows` must be strings. `run = ["echo one", "echo two"]` is not supported.
 
 To run separate spawned inline commands, define multiple hooks. Each hook entry is a separate
 execution, so mise starts one subprocess per `run` entry:
