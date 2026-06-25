@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# Test that the global postinstall hook only runs when a tool was actually
+# installed, and is skipped on a no-op `mise install` (#10574)
+
+cat <<EOF >mise.toml
+[tools]
+dummy = "latest"
+
+[hooks]
+postinstall = "echo ran >> postinstall.log"
+EOF
+
+# Force a real install of dummy
+rm -rf ~/.mise/installs/dummy
+rm -f postinstall.log
+
+# First install: dummy is missing, so the hook should run once
+mise install
+assert "cat postinstall.log" "ran"
+
+# Second install: everything is already installed ("all tools are installed"),
+# so the hook should NOT run again — the log must be unchanged
+mise install
+assert "cat postinstall.log" "ran"
