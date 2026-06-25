@@ -12,10 +12,12 @@ preinstall = { run = 'echo PREINSTALL' }
 postinstall = { run = 'echo POSTINSTALL' }
 EOF
 
+# preinstall + postinstall fire when a tool is actually installed
 assert_contains "mise i 2>&1" "PREINSTALL"
 assert_contains "mise i dummy@1 2>&1" "POSTINSTALL"
-assert_contains "mise i 2>&1" "POSTINSTALL"
-assert_contains "mise i dummy@1 2>&1" "POSTINSTALL"
+# nothing left to install → postinstall is skipped (#10574)
+assert_not_contains "mise i 2>&1" "POSTINSTALL"
+assert_not_contains "mise i dummy@1 2>&1" "POSTINSTALL"
 eval "$(mise hook-env)"
 
 cd ~/workdir || exit 1

@@ -6,12 +6,11 @@ use crate::cli::args::ToolArg;
 use crate::config::Config;
 use crate::config::Settings;
 use crate::errors::split_install_result;
-use crate::hooks::Hooks;
 use crate::install_before::resolve_cli_minimum_release_age;
 use crate::toolset::{
     InstallOptions, ResolveOptions, ToolRequest, ToolSource, Toolset, tool_env_vars,
 };
-use crate::{config, env, exit, hooks};
+use crate::{config, env, exit};
 use clap::ValueHint;
 use eyre::Result;
 use itertools::Itertools;
@@ -420,17 +419,9 @@ impl Install {
         });
         let has_missing = !missing.is_empty();
         let (versions, install_error) = if missing.is_empty() {
-            measure!("run_postinstall_hook", {
-                info!("all tools are installed");
-                hooks::run_one_hook(
-                    &config,
-                    config.get_toolset().await?,
-                    Hooks::Postinstall,
-                    None,
-                )
-                .await;
-                (vec![], Ok(()))
-            })
+            // Nothing was installed, so don't run the postinstall hook (#10574)
+            info!("all tools are installed");
+            (vec![], Ok(()))
         } else {
             let mut ts = Toolset::from(trs.clone());
             measure!("install_all_versions", {

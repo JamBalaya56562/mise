@@ -209,8 +209,8 @@ impl Toolset {
             mpr.footer_finish();
         }
 
-        // Skip hooks in dry-run mode
-        if !opts.dry_run {
+        // Skip hooks in dry-run mode, and when nothing was actually installed (#10574)
+        if !opts.dry_run && !installed.is_empty() {
             // Run post-install hook with installed tools info
             // Use the full resolved toolset so all installed tools are on PATH
             // Fall back to self if toolset resolution fails (e.g. due to config issues)
