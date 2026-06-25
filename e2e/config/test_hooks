@@ -12,9 +12,12 @@ preinstall = { run = 'echo PREINSTALL' }
 postinstall = { run = 'echo POSTINSTALL' }
 EOF
 
+# preinstall + postinstall hooks fire when installing
 assert_contains "mise i 2>&1" "PREINSTALL"
 assert_contains "mise i dummy@1 2>&1" "POSTINSTALL"
-assert_contains "mise i 2>&1" "POSTINSTALL"
+# `mise i` with nothing missing is a no-op, so postinstall is skipped (#10574)
+assert_not_contains "mise i 2>&1" "POSTINSTALL"
+# explicitly requesting a tool still triggers the install hooks
 assert_contains "mise i dummy@1 2>&1" "POSTINSTALL"
 eval "$(mise hook-env)"
 

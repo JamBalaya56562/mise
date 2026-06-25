@@ -59,6 +59,8 @@ postinstall = { run = "echo installed", run_windows = "Write-Output installed" }
 
 For `preinstall` and `postinstall`, `script = ...` is a legacy alias for `run = ...`. If a `shell` is also set on a `script`/`scripts` hook, mise warns that the shell is ignored and still runs the script with the default inline shell. Use `run = ...` with `shell = "bash -c"` to choose the inline shell command. The `script` alias for install hooks is deprecated.
 
+A bare `mise install` (no tool arguments) that finds nothing to install — i.e. all configured tools are already installed and it reports "all tools are installed" — does not run the `postinstall` hook.
+
 The `postinstall` hook receives a `MISE_INSTALLED_TOOLS` environment variable containing a JSON array of the tools that were just installed:
 
 ```toml
