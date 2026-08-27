@@ -566,6 +566,8 @@ mod tests {
         assert_snapshot!(Pwsh::default().unset_env("FOO"));
     }
 
+    /// Pins the exact text of the block `activate` prepends to every session, `-ErrorAction`
+    /// values included -- see the test below for what rides on that argument.
     #[test]
     fn test_deactivate() {
         let deactivate = Pwsh::default().deactivate();
