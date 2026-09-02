@@ -178,14 +178,11 @@ echo "from-posix"
         mise run testtask | Select -Last 1 | Should -Be 'windows'
     }
 
-    It 'converts PATH to MSYS Unix form for bash subshell tasks' {
-        # Repro for the per-task `tools = {...}` + `shell = "bash -c"` case.
-        # When mise on Windows spawns bash for a task, PATH must be `:`-separated
-        # `/c/...` form, not `;`-separated `C:\...` form, or bash cannot resolve
-        # any command, including the one mise just installed for the task.
-        #
-        # We assert on the PATH the task observes, not on a tool install, so the
-        # test runs without depending on rust/cargo or any toolchain backend.
+    It 'leaves a bash task PATH that both bash and a native grandchild can use' {
+        # mise used to convert PATH to MSYS Unix form before spawning bash. MSYS does not
+        # re-parse a POSIX PATH from a native parent, so it passed the whole thing to the next
+        # native process as one entry. Both ends are asserted: the first is what the conversion
+        # was for and MSYS does it unaided, the second is what the conversion broke.
 
         if (-not (Get-Command bash.exe -ErrorAction SilentlyContinue)) {
             Set-ItResult -Skipped -Because "bash.exe (Git Bash / MSYS) not on PATH"
@@ -193,72 +190,37 @@ echo "from-posix"
         }
 
         @'
-[tasks.path_repro]
+[tasks.bash_sees]
 shell = "bash -c"
-run = '''
-case "$PATH" in
-  *\;*)
-    echo "PATH-still-windows-style"
-    ;;
-  *)
-    echo "PATH-unix-style"
-    ;;
-esac
-'''
-'@ | Out-File -FilePath "mise.path_repro.toml" -Encoding utf8NoBOM
+run = 'echo "$PATH"'
 
-        $env:MISE_CONFIG_FILE = "$TestDrive\mise.path_repro.toml"
-        try {
-            $output = mise run path_repro 2>&1 | Select -Last 1
-            $output | Should -Be 'PATH-unix-style'
-        }
-        finally {
-            Remove-Item -Path Env:\MISE_CONFIG_FILE -ErrorAction SilentlyContinue
-            Remove-Item -Path "$TestDrive\mise.path_repro.toml" -ErrorAction SilentlyContinue
-        }
-    }
-
-    It 'converts PATH to /cygdrive form for a Cygwin bash subshell task' {
-        # Cygwin resolves drives via `/cygdrive/c/...`, not Git Bash's `/c/...`.
-        # When mise detects a Cygwin bash (here pinned via MISE_BASH_PATH), the
-        # task's PATH must use the `/cygdrive/` form or commands won't resolve.
-        # Skipped unless Cygwin is actually installed, since CI runners lack it.
-
-        $cygwinBash = "C:\cygwin64\bin\bash.exe"
-        if (-not (Test-Path $cygwinBash)) {
-            Set-ItResult -Skipped -Because "Cygwin bash not installed at $cygwinBash"
-            return
-        }
-
-        @'
-[tasks.cygdrive_repro]
+[tasks.grandchild_sees]
 shell = "bash -c"
-run = '''
-case "$PATH" in
-  */cygdrive/*)
-    echo "PATH-cygdrive-style"
-    ;;
-  *)
-    echo "PATH-not-cygdrive"
-    ;;
-esac
-'''
-'@ | Out-File -FilePath "mise.cygdrive_repro.toml" -Encoding utf8NoBOM
+run = "powershell -NoProfile -Command '$env:PATH'"
+'@ | Out-File -FilePath "$TestDrive\mise.path_shape.toml" -Encoding utf8NoBOM
 
-        # Save and restore the env vars we override so a dev machine's real
-        # settings (a developer may export MISE_BASH_PATH / MISE_CYGDRIVE_PREFIX)
-        # and later tests are not disturbed. Pin MISE_CYGDRIVE_PREFIX to the
-        # default so the `/cygdrive` assertion holds even when the caller has
-        # exported a custom prefix such as `/mnt` (which the feature honors).
         $oldConfig = $env:MISE_CONFIG_FILE
-        $oldBashPath = $env:MISE_BASH_PATH
-        $oldCygPrefix = $env:MISE_CYGDRIVE_PREFIX
-        $env:MISE_CONFIG_FILE = "$TestDrive\mise.cygdrive_repro.toml"
-        $env:MISE_BASH_PATH = $cygwinBash
-        $env:MISE_CYGDRIVE_PREFIX = "/cygdrive"
+        $env:MISE_CONFIG_FILE = "$TestDrive\mise.path_shape.toml"
         try {
-            $output = mise run cygdrive_repro 2>&1 | Select -Last 1
-            $output | Should -Be 'PATH-cygdrive-style'
+            # Exit code and emptiness first: `Should -Not -Match` holds for no output at all, and a
+            # test that passes when the task never ran is the shape this PR is removing.
+            $inBash = mise run bash_sees 2>&1 | Select -Last 1
+            $LASTEXITCODE | Should -Be 0
+            $inBash | Should -Not -BeNullOrEmpty
+            $inBash | Should -Not -Match ';'
+
+            $inGrandchild = mise run grandchild_sees 2>&1 | Select -Last 1
+            $LASTEXITCODE | Should -Be 0
+            $inGrandchild | Should -Not -BeNullOrEmpty
+            # A trailing ';' is ordinary, so empty entries are not the subject here.
+            $entries = @($inGrandchild -split ';' | Where-Object { $_ -ne '' })
+            $entries.Count | Should -BeGreaterThan 1
+            # Every entry a Windows path -- a drive letter or a UNC share, both of which PATH
+            # takes. The defect put a whole ':'-joined list in one of them.
+            foreach ($e in $entries) {
+                $e | Should -Match '^(?:[A-Za-z]:|\\\\)'
+                $e.Substring(2) | Should -Not -Match ':'
+            }
         }
         finally {
             if ($null -eq $oldConfig) {
@@ -266,17 +228,7 @@ esac
             } else {
                 $env:MISE_CONFIG_FILE = $oldConfig
             }
-            if ($null -eq $oldBashPath) {
-                Remove-Item -Path Env:\MISE_BASH_PATH -ErrorAction SilentlyContinue
-            } else {
-                $env:MISE_BASH_PATH = $oldBashPath
-            }
-            if ($null -eq $oldCygPrefix) {
-                Remove-Item -Path Env:\MISE_CYGDRIVE_PREFIX -ErrorAction SilentlyContinue
-            } else {
-                $env:MISE_CYGDRIVE_PREFIX = $oldCygPrefix
-            }
-            Remove-Item -Path "$TestDrive\mise.cygdrive_repro.toml" -ErrorAction SilentlyContinue
+            Remove-Item -Path "$TestDrive\mise.path_shape.toml" -ErrorAction SilentlyContinue
         }
     }
 
