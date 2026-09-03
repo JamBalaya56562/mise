@@ -1,0 +1,88 @@
+# Standalone evidence for PR #12696. Runs nothing but the PATH measurements, so
+# the result is readable on its own and finishes in minutes rather than with the
+# full suite. Lives on a throwaway branch; kept until that PR merges.
+name: win-path-probe
+
+on:
+  push:
+    branches: ["probe/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  # Fast lane: the runtimes themselves, no mise anywhere. Establishes what
+  # MSYS2 / Git Bash / Cygwin actually do, so the mise measurement below can be
+  # read against a known baseline.
+  runtime-truth:
+    name: runtime truth (no mise)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Cygwin
+        shell: pwsh
+        run: |
+          choco install cygwin -y --no-progress
+          Get-ChildItem 'C:\tools\cygwin\bin\bash.exe','C:\cygwin64\bin\bash.exe' -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "cygwin bash: $($_.FullName)" }
+      # pwsh, not bash: a bash-driven probe is already inside MSYS and would
+      # measure the wrong parent process.
+      - name: Measure
+        shell: pwsh
+        run: ./probe/win_path_truth.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: runtime-truth
+          path: C:\zzzprobe\runtime_truth.json
+          if-no-files-found: warn
+
+  # Slow lane: the same instrument driven through `mise run`, for a released
+  # mise that still pre-converts PATH and for this branch, which does not.
+  mise-in-loop:
+    name: mise in the loop (old vs new)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MISE_DATA_DIR: ~/.local/share/mise
+      MISE_CACHE_DIR: ~/.cache/mise
+      MBX_TARGET_VIEWS: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/mbx
+        with:
+          backend: server
+      - name: Build this branch
+        shell: pwsh
+        run: mbx build --no-default-features --features rustls-native-roots,vfox/vendored-lua,self_update
+      - name: Fetch a released mise that still pre-converts PATH
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path C:\zzzprobe\old -Force | Out-Null
+          gh release download v2026.9.0 --repo jdx/mise `
+            --pattern 'mise-v2026.9.0-windows-x64.exe' --output C:\zzzprobe\old\mise.exe
+          & C:\zzzprobe\old\mise.exe --version
+      - name: Install Cygwin
+        shell: pwsh
+        run: choco install cygwin -y --no-progress
+      - name: Measure
+        shell: pwsh
+        run: |
+          ./probe/mise_in_loop.ps1 -Binaries @{
+            'old-2026.9.0' = 'C:\zzzprobe\old\mise.exe'
+            'new-this-pr'  = "$env:GITHUB_WORKSPACE\target\debug\mise.exe"
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: mise-in-loop
+          path: C:\zzzprobe\mise_in_loop.json
+          if-no-files-found: warn
