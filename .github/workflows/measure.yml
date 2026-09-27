@@ -1,0 +1,39 @@
+name: measure-shim-copy-check
+on: push
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build probe
+        shell: pwsh
+        working-directory: measure
+        run: |
+          rustc --version
+          rustc --edition 2024 -O -o timing.exe timing.rs
+      - name: Measure
+        shell: pwsh
+        working-directory: measure
+        run: |
+          # Random bytes stand in for a real tool: no marker, so every fingerprint scan runs to the end.
+          $random = [Random]::new(1)
+          foreach ($mib in 1, 4, 8, 15) {
+            $bytes = [byte[]]::new($mib * 1MB)
+            $random.NextBytes($bytes)
+            [IO.File]::WriteAllBytes("$PWD\random-$mib-MiB.exe", $bytes)
+          }
+          # A shim-sized file carrying the marker, i.e. a real copy.
+          $copy = [byte[]]::new(300KB)
+          $marker = [IO.File]::ReadAllBytes("$PWD\native-shim-marker")
+          [Array]::Copy($marker, 0, $copy, 1000, $marker.Length)
+          [IO.File]::WriteAllBytes("$PWD\shim-copy.exe", $copy)
+          $real = Get-ChildItem 'C:\Program Files\Git\usr\bin', 'C:\Program Files\Git\mingw64\bin' -Filter *.exe |
+            Where-Object { $_.Length -gt 1MB -and $_.Length -lt 16MB } | Sort-Object Length
+          $picked = @($real[0], $real[[int]($real.Count / 2)], $real[-1]) | Select-Object -Unique
+          $files = @((Get-ChildItem random-*.exe | Sort-Object Length).FullName) + "$PWD\shim-copy.exe" + $picked.FullName + (Get-Command gh).Source
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors | Format-List
+          $table = ./timing.exe "$PWD\elsewhere.exe" @files
+          $table
+          $table | Out-File -Append $env:GITHUB_STEP_SUMMARY
