@@ -2079,7 +2079,13 @@ mod tests {
             .to_string();
         let init = run.find(" daemons __init ").unwrap();
         assert!(init < run.find("echo ready").unwrap());
-        assert!(run.contains("&& echo ready && exec "));
+        // cmd.exe has no `exec`, so on Windows the server follows the steps directly.
+        let server = if cfg!(windows) {
+            "&& echo ready && postgres "
+        } else {
+            "&& echo ready && exec "
+        };
+        assert!(run.contains(server), "{run}");
         // A task daemon with init keeps pitchfork's `mise x` wrapper, so the
         // steps and the task share one shell that has the project's tools.
         let wrapped = files(&[(

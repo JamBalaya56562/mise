@@ -470,8 +470,16 @@ worktrees at once can cause collisions.
 ## Service presets
 
 Presets supply the service command, required tool, readiness check, data directory,
-and connection environment variables. They are currently Unix-only. NATS and
-SpiceDB also require `curl` on `PATH` for their HTTP readiness checks.
+and connection environment variables. NATS and SpiceDB also require `curl` on `PATH`
+for their HTTP readiness checks.
+
+On Windows, every preset except `redis`, which has no Windows build, runs under
+pitchfork's default `cmd /C` shell; a different `windows_shell` is not supported.
+PostgreSQL stops cleanly only with pitchfork 2.29.0 or later, which sends it Ctrl+C;
+older versions terminate it, and it recovers on the next start. Windows also
+reserves some port ranges for Hyper-V and WSL (see
+`netsh interface ipv4 show excludedportrange protocol=tcp`). If a preset's port
+falls in one, set `port` or `ports` to another.
 
 | Preset                        | Tool          | Default port | Additional listeners                  |
 | ----------------------------- | ------------- | ------------ | ------------------------------------- |
